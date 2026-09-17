@@ -1,4 +1,4 @@
-const {
+﻿const {
     Client,
     LocalAuth,
     MessageMedia,
@@ -26,7 +26,7 @@ app.use(express.json({ limit: "50mb" }));
    getChatById / fetchMessages throw "r: r" errors)
 ========================= */
 
-const recentMessages = {}; // { chatId: messageObject } — keyed by whatever WhatsApp sends (c.us or lid)
+const recentMessages = {}; // { chatId: messageObject } â€” keyed by whatever WhatsApp sends (c.us or lid)
 const recentMediaMessages = {}; // { chatId: mediaMessageObject }
 let lastReceivedMessage = null; // fallback: most recent inbound message from anyone, regardless of id format
 let lastReceivedMediaMessage = null;
@@ -243,7 +243,7 @@ app.post("/send-image", async (req, res) => {
         const chatId = chatIdFromPhone(phone);
 
         const media = MessageMedia.fromFilePath(
-            "/app/test.jpg"
+            "/app/sample.jpg"
         );
 
         await client.sendMessage(
@@ -281,7 +281,7 @@ app.post("/send-document", async (req, res) => {
         const chatId = chatIdFromPhone(phone);
 
         const media = MessageMedia.fromFilePath(
-            "/app/resume.docx"
+            "/app/sample.docx"
         );
 
         await client.sendMessage(
@@ -328,7 +328,7 @@ app.post("/test/reply", async (req, res) => {
             return failure(
                 res,
                 new Error(
-                    "No cached message found for this exact phone/id — WhatsApp may have delivered it under a different id (e.g. @lid instead of @c.us). Pass \"useLastMessage\": true to reply to the most recent inbound message from anyone instead."
+                    "No cached message found for this exact phone/id â€” WhatsApp may have delivered it under a different id (e.g. @lid instead of @c.us). Pass \"useLastMessage\": true to reply to the most recent inbound message from anyone instead."
                 )
             );
         }
@@ -373,7 +373,7 @@ app.post("/test/react", async (req, res) => {
             return failure(
                 res,
                 new Error(
-                    "No cached message found for this exact phone/id — WhatsApp may have delivered it under a different id (e.g. @lid instead of @c.us). Pass \"useLastMessage\": true to react to the most recent inbound message from anyone instead."
+                    "No cached message found for this exact phone/id â€” WhatsApp may have delivered it under a different id (e.g. @lid instead of @c.us). Pass \"useLastMessage\": true to react to the most recent inbound message from anyone instead."
                 )
             );
         }
@@ -1425,7 +1425,7 @@ app.post(
                 return failure(
                     res,
                     new Error(
-                        "No cached media message found for this exact phone/id — WhatsApp may have delivered it under a different id (e.g. @lid). Pass \"useLastMessage\": true to use the most recent inbound media from anyone instead."
+                        "No cached media message found for this exact phone/id â€” WhatsApp may have delivered it under a different id (e.g. @lid). Pass \"useLastMessage\": true to use the most recent inbound media from anyone instead."
                     )
                 );
             }

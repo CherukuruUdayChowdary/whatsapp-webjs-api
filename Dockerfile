@@ -17,8 +17,8 @@ RUN npm install
 
 # Copy application files
 COPY index.js .
-COPY test.jpg .
-COPY resume.docx .
+COPY sample.jpg .
+COPY sample.docx .
 
 # Create WhatsApp Web.js authentication directory
 RUN mkdir -p /app/.wwebjs_auth
