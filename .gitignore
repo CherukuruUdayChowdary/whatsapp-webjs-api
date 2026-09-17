@@ -1,0 +1,8 @@
+node_modules/
+.wwebjs_auth/
+.wwebjs_cache/
+.env
+routes.txt
+msg.json
+dashboard/config.php
+dashboard/data/
