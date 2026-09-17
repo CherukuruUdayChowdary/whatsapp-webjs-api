@@ -5,4 +5,5 @@ node_modules/
 routes.txt
 msg.json
 dashboard/config.php
-dashboard/data/
+dashboard/data/*
+!dashboard/data/.htaccess
