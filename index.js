@@ -1,4 +1,14 @@
-﻿const {
+/* =========================================================
+   WhatsApp Web.js API — multi-account version
+   - Several WhatsApp numbers in one container
+   - Pick the number per request with the "x-account" header,
+     "?account=" query or "account" field in the JSON body
+     (defaults to "default", the number that was already linked)
+========================================================= */
+
+const fs = require("fs");
+const path = require("path");
+const {
     Client,
     LocalAuth,
     MessageMedia,
@@ -6,58 +16,27 @@
     Poll
 } = require("whatsapp-web.js");
 
-const qrcode = require("qrcode-terminal");
+const qrcodeTerminal = require("qrcode-terminal");
+const QRCode = require("qrcode");
 const express = require("express");
 
+const AUTH_PATH = process.env.AUTH_PATH || "/app/.wwebjs_auth";
+const ACCOUNTS_FILE = path.join(AUTH_PATH, "accounts.json");
+const DEFAULT_ACCOUNT = "default";
+const ACCOUNT_ID_RE = /^[a-z0-9_-]{1,32}$/;
+const MAX_ACCOUNTS = Number(process.env.MAX_ACCOUNTS || 5);
+
 const app = express();
+
 app.use((req, res, next) => {
-  if (req.path === '/health') return next();
-  const key = process.env.API_KEY;
-  if (!key || req.get('x-api-key') !== key) {
-    return res.status(401).json({ success: false, error: 'Unauthorized' });
-  }
-  next();
+    if (req.path === "/health") return next();
+    const key = process.env.API_KEY;
+    if (!key || req.get("x-api-key") !== key) {
+        return res.status(401).json({ success: false, error: "Unauthorized" });
+    }
+    next();
 });
 app.use(express.json({ limit: "50mb" }));
-
-/* =========================
-   MESSAGE CACHE
-   (workaround for the current whatsapp-web.js bug where
-   getChatById / fetchMessages throw "r: r" errors)
-========================= */
-
-const recentMessages = {}; // { chatId: messageObject } â€” keyed by whatever WhatsApp sends (c.us or lid)
-const recentMediaMessages = {}; // { chatId: mediaMessageObject }
-let lastReceivedMessage = null; // fallback: most recent inbound message from anyone, regardless of id format
-let lastReceivedMediaMessage = null;
-
-/* =========================
-   WHATSAPP CLIENT
-========================= */
-
-const client = new Client({
-    authStrategy: new LocalAuth({
-        dataPath: "/app/.wwebjs_auth"
-    }),
-
-    puppeteer: {
-        executablePath: "/usr/bin/chromium",
-        headless: true,
-        args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-first-run",
-            "--no-zygote",
-            "--disable-extensions",
-            "--headless=new",
-            "--disable-software-rasterizer",
-            "--disable-background-networking",
-            "--disable-features=Translate,BackForwardCache"
-        ]
-    }
-});
 
 /* =========================
    HELPER FUNCTIONS
@@ -78,97 +57,412 @@ function success(res, data = {}) {
     });
 }
 
-function failure(res, error) {
-    console.error(error);
+function failure(res, error, status = 500) {
+    if (status >= 500) console.error(error);
 
-    return res.status(500).json({
+    return res.status(status).json({
         success: false,
         error: error?.message || String(error)
     });
 }
 
 /* =========================
-   WHATSAPP EVENTS
+   ACCOUNTS
 ========================= */
 
-client.on("qr", (qr) => {
-    console.log("Scan this QR code with WhatsApp:");
-    qrcode.generate(qr, { small: true });
-});
+const accounts = new Map(); // id -> account object
 
-client.on("authenticated", () => {
-    console.log("WhatsApp authenticated successfully.");
-});
+function loadAccountIds() {
+    try {
+        const ids = JSON.parse(fs.readFileSync(ACCOUNTS_FILE, "utf8"));
+        if (Array.isArray(ids)) {
+            return ids.filter((id) => ACCOUNT_ID_RE.test(id));
+        }
+    } catch (error) {
+        // first run: no file yet
+    }
+    return [];
+}
 
-client.on("ready", () => {
-    console.log("WhatsApp Web.js is ready!");
-});
+function saveAccountIds() {
+    fs.mkdirSync(AUTH_PATH, { recursive: true });
+    fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify([...accounts.keys()]));
+}
 
-client.on("auth_failure", (message) => {
-    console.error("Authentication failure:", message);
-});
+function sessionDir(id) {
+    // LocalAuth stores the default (no clientId) session in "session",
+    // and every other account in "session-<clientId>"
+    return path.join(
+        AUTH_PATH,
+        id === DEFAULT_ACCOUNT ? "session" : `session-${id}`
+    );
+}
 
-client.on("disconnected", (reason) => {
-    console.log("WhatsApp disconnected:", reason);
-});
+function publicAccount(acc) {
+    return {
+        id: acc.id,
+        state: acc.state,
+        phone: acc.client?.info?.wid?.user || null,
+        pushname: acc.client?.info?.pushname || null,
+        lastError: acc.lastError || null
+    };
+}
+
+function buildClient(id) {
+    const authStrategy =
+        id === DEFAULT_ACCOUNT
+            ? new LocalAuth({ dataPath: AUTH_PATH }) // keeps the existing session
+            : new LocalAuth({ dataPath: AUTH_PATH, clientId: id });
+
+    return new Client({
+        authStrategy,
+        puppeteer: {
+            executablePath: "/usr/bin/chromium",
+            headless: true,
+            args: [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-zygote",
+                "--disable-extensions",
+                "--headless=new",
+                "--disable-software-rasterizer",
+                "--disable-background-networking",
+                "--disable-features=Translate,BackForwardCache"
+            ]
+        }
+    });
+}
 
 /* =========================
-   RECEIVE MESSAGES
+   RECEIVE MESSAGES (per account)
    Listens on both "message" and "message_create", because some
    WhatsApp Web versions stop firing "message" for incoming chats.
    Each message is handled only once (de-duplicated by id).
 ========================= */
 
-const seenMessageIds = new Set();
+// WhatsApp system notices that should never count as "last received message"
+const SYSTEM_MESSAGE_TYPES = new Set([
+    "e2e_notification",
+    "notification_template",
+    "notification",
+    "gp2",
+    "protocol",
+    "call_log",
+    "ciphertext",
+    "revoked"
+]);
 
-async function handleIncoming(message, source) {
+async function handleIncoming(acc, message, source) {
     if (message.fromMe) return;
+    if (message.isStatus) return;
+    if (SYSTEM_MESSAGE_TYPES.has(message.type)) return;
 
     const id = message.id?._serialized;
     if (id) {
-        if (seenMessageIds.has(id)) return;
-        seenMessageIds.add(id);
-        if (seenMessageIds.size > 1000) seenMessageIds.clear();
+        if (acc.seen.has(id)) return;
+        acc.seen.add(id);
+        if (acc.seen.size > 1000) acc.seen.clear();
     }
 
     console.log(
-        `[MESSAGE:${source}] ${message.from}: ${message.body || "[media/message]"}`
+        `[${acc.id}] [MESSAGE:${source}] ${message.from}: ${message.body || "[media/message]"}`
     );
     console.log(
-        `[MESSAGE DETAIL] id=${id} type=${message.type} hasMedia=${message.hasMedia} isStatus=${message.isStatus}`
+        `[${acc.id}] [MESSAGE DETAIL] id=${id} type=${message.type} hasMedia=${message.hasMedia} isStatus=${message.isStatus}`
     );
 
     // Cache the latest message per chat so /test/reply, /test/react and
     // /test/download-media don't need the currently-broken fetchMessages().
-    recentMessages[message.from] = message;
-    lastReceivedMessage = message;
+    acc.recentMessages[message.from] = message;
+    acc.lastReceivedMessage = message;
 
     if (message.hasMedia) {
-        recentMediaMessages[message.from] = message;
-        lastReceivedMediaMessage = message;
+        acc.recentMediaMessages[message.from] = message;
+        acc.lastReceivedMediaMessage = message;
     }
 
     if (message.body === "!ping") {
         try {
             await message.reply("pong");
         } catch (error) {
-            console.error("Reply error:", error);
+            console.error(`[${acc.id}] Reply error:`, error);
         }
     }
 }
 
-client.on("message", (message) => handleIncoming(message, "message"));
-client.on("message_create", (message) => handleIncoming(message, "message_create"));
+function startAccount(id, delayMs = 0) {
+    const acc = {
+        id,
+        state: "initializing",
+        qr: null,
+        qrImage: null,
+        lastError: null,
+        recentMessages: {},
+        recentMediaMessages: {},
+        lastReceivedMessage: null,
+        lastReceivedMediaMessage: null,
+        seen: new Set(),
+        stopping: false
+    };
+
+    const client = buildClient(id);
+    const tag = `[${id}]`;
+    acc.client = client;
+    accounts.set(id, acc);
+
+    client.on("qr", async (qr) => {
+        acc.state = "qr";
+        acc.qr = qr;
+        try {
+            acc.qrImage = await QRCode.toDataURL(qr, { margin: 1, width: 300 });
+        } catch (error) {
+            acc.qrImage = null;
+        }
+        console.log(`${tag} Scan this QR code (also available at GET /accounts/${id}/qr):`);
+        qrcodeTerminal.generate(qr, { small: true });
+    });
+
+    client.on("authenticated", () => {
+        acc.state = "authenticated";
+        acc.qr = null;
+        acc.qrImage = null;
+        console.log(`${tag} WhatsApp authenticated successfully.`);
+    });
+
+    client.on("ready", () => {
+        acc.state = "ready";
+        acc.lastError = null;
+        console.log(`${tag} WhatsApp Web.js is ready! (${client.info?.wid?.user || "unknown number"})`);
+    });
+
+    client.on("auth_failure", (message) => {
+        acc.state = "auth_failure";
+        acc.lastError = String(message);
+        console.error(`${tag} Authentication failure:`, message);
+    });
+
+    client.on("disconnected", (reason) => {
+        console.log(`${tag} WhatsApp disconnected:`, reason);
+        acc.state = "disconnected";
+        acc.lastError = String(reason);
+        if (acc.stopping) return;
+
+        // Start again so a new QR code (or the saved session) is used
+        setTimeout(() => {
+            if (accounts.get(id) === acc && !acc.stopping) {
+                restartAccount(id).catch((error) =>
+                    console.error(`${tag} restart failed:`, error)
+                );
+            }
+        }, 5000);
+    });
+
+    client.on("message", (message) => handleIncoming(acc, message, "message"));
+    client.on("message_create", (message) => handleIncoming(acc, message, "message_create"));
+
+    setTimeout(() => {
+        client.initialize().catch((error) => {
+            acc.state = "error";
+            acc.lastError = error?.message || String(error);
+            console.error(`${tag} initialize failed:`, error);
+        });
+    }, delayMs);
+
+    return acc;
+}
+
+async function stopAccount(id) {
+    const acc = accounts.get(id);
+    if (!acc) return;
+
+    acc.stopping = true;
+    accounts.delete(id);
+
+    try {
+        await acc.client.destroy();
+    } catch (error) {
+        console.error(`[${id}] destroy error:`, error?.message || error);
+    }
+}
+
+async function restartAccount(id) {
+    await stopAccount(id);
+    return startAccount(id);
+}
+
+function getAccountOr404(req, res) {
+    const id = String(req.params.id || "").toLowerCase();
+    const acc = accounts.get(id);
+    if (!acc) {
+        failure(res, new Error(`Unknown account "${id}"`), 404);
+        return null;
+    }
+    return acc;
+}
+
+/* =========================
+   ACCOUNT MANAGEMENT
+========================= */
+
+app.get("/accounts", (req, res) => {
+    success(res, {
+        accounts: [...accounts.values()].map(publicAccount)
+    });
+});
+
+app.post("/accounts", (req, res) => {
+    try {
+        const id = String(req.body?.id || "").trim().toLowerCase();
+
+        if (!ACCOUNT_ID_RE.test(id)) {
+            return failure(
+                res,
+                new Error("id must be 1-32 characters: lowercase letters, numbers, - or _"),
+                400
+            );
+        }
+        if (accounts.has(id)) {
+            return failure(res, new Error(`Account "${id}" already exists`), 409);
+        }
+        if (accounts.size >= MAX_ACCOUNTS) {
+            return failure(res, new Error(`Maximum of ${MAX_ACCOUNTS} accounts reached`), 400);
+        }
+
+        const acc = startAccount(id);
+        saveAccountIds();
+
+        success(res, {
+            account: publicAccount(acc),
+            message: `Account created. Open GET /accounts/${id}/qr and scan the QR code with the new phone.`
+        });
+    } catch (error) {
+        failure(res, error);
+    }
+});
+
+app.get("/accounts/:id", (req, res) => {
+    const acc = getAccountOr404(req, res);
+    if (!acc) return;
+    success(res, { account: publicAccount(acc) });
+});
+
+app.get("/accounts/:id/qr", (req, res) => {
+    const acc = getAccountOr404(req, res);
+    if (!acc) return;
+    success(res, {
+        id: acc.id,
+        state: acc.state,
+        qr: acc.qr,
+        qrImage: acc.qrImage // data:image/png;base64,... (null unless state is "qr")
+    });
+});
+
+app.post("/accounts/:id/restart", async (req, res) => {
+    try {
+        const acc = getAccountOr404(req, res);
+        if (!acc) return;
+        const fresh = await restartAccount(acc.id);
+        success(res, { account: publicAccount(fresh), message: "Account restarting" });
+    } catch (error) {
+        failure(res, error);
+    }
+});
+
+app.post("/accounts/:id/logout", async (req, res) => {
+    try {
+        const acc = getAccountOr404(req, res);
+        if (!acc) return;
+
+        acc.stopping = true; // don't auto-restart from the "disconnected" event
+        try {
+            await acc.client.logout(); // unlinks the device and deletes the session
+        } catch (error) {
+            console.error(`[${acc.id}] logout error:`, error?.message || error);
+        }
+
+        const fresh = await restartAccount(acc.id);
+        success(res, {
+            account: publicAccount(fresh),
+            message: "Logged out. A new QR code will be available shortly."
+        });
+    } catch (error) {
+        failure(res, error);
+    }
+});
+
+app.delete("/accounts/:id", async (req, res) => {
+    try {
+        const acc = getAccountOr404(req, res);
+        if (!acc) return;
+
+        if (acc.id === DEFAULT_ACCOUNT) {
+            return failure(res, new Error("The default account can't be deleted (use logout instead)"), 400);
+        }
+
+        await stopAccount(acc.id);
+        saveAccountIds();
+
+        const removeSession = req.query.removeSession === "true";
+        if (removeSession) {
+            fs.rmSync(sessionDir(acc.id), { recursive: true, force: true });
+        }
+
+        success(res, {
+            id: acc.id,
+            removedSession: removeSession,
+            message: "Account deleted"
+        });
+    } catch (error) {
+        failure(res, error);
+    }
+});
 
 /* =========================
    HEALTH
 ========================= */
 
 app.get("/health", (req, res) => {
+    const def = accounts.get(DEFAULT_ACCOUNT);
     success(res, {
         status: "running",
-        whatsappReady: client.info ? true : false
+        whatsappReady: def?.state === "ready",
+        accounts: [...accounts.values()].map((acc) => ({
+            id: acc.id,
+            state: acc.state
+        }))
     });
+});
+
+/* =========================
+   ACCOUNT SELECTION
+   Every route below runs against req.wa (the chosen account)
+========================= */
+
+app.use((req, res, next) => {
+    const id = String(
+        req.get("x-account") ||
+        req.query?.account ||
+        req.body?.account ||
+        DEFAULT_ACCOUNT
+    ).toLowerCase();
+
+    const acc = accounts.get(id);
+    if (!acc) {
+        return failure(res, new Error(`Unknown account "${id}"`), 404);
+    }
+    if (acc.state !== "ready") {
+        return failure(
+            res,
+            new Error(`Account "${id}" is not ready (state: ${acc.state})`),
+            503
+        );
+    }
+
+    req.wa = acc;
+    next();
 });
 
 /* =========================
@@ -177,19 +471,15 @@ app.get("/health", (req, res) => {
 
 app.get("/test/client-info", async (req, res) => {
     try {
-        if (!client.info) {
-            return failure(
-                res,
-                new Error("WhatsApp client is not ready")
-            );
-        }
+        const info = req.wa.client.info;
 
         success(res, {
+            account: req.wa.id,
             info: {
-                wid: client.info.wid?._serialized,
-                pushname: client.info.pushname,
-                phone: client.info.wid?.user,
-                platform: client.info.platform
+                wid: info?.wid?._serialized,
+                pushname: info?.pushname,
+                phone: info?.wid?.user,
+                platform: info?.platform
             }
         });
     } catch (error) {
@@ -214,7 +504,7 @@ app.post("/send", async (req, res) => {
 
         const chatId = chatIdFromPhone(phone);
 
-        await client.sendMessage(chatId, message);
+        await req.wa.client.sendMessage(chatId, message);
 
         success(res, {
             to: chatId,
@@ -246,7 +536,7 @@ app.post("/send-image", async (req, res) => {
             "/app/sample.jpg"
         );
 
-        await client.sendMessage(
+        await req.wa.client.sendMessage(
             chatId,
             media,
             {
@@ -284,7 +574,7 @@ app.post("/send-document", async (req, res) => {
             "/app/sample.docx"
         );
 
-        await client.sendMessage(
+        await req.wa.client.sendMessage(
             chatId,
             media,
             {
@@ -318,17 +608,17 @@ app.post("/test/reply", async (req, res) => {
         }
 
         const chatId = chatIdFromPhone(phone);
-        let target = recentMessages[chatId];
+        let target = req.wa.recentMessages[chatId];
 
         if (!target && useLastMessage) {
-            target = lastReceivedMessage;
+            target = req.wa.lastReceivedMessage;
         }
 
         if (!target) {
             return failure(
                 res,
                 new Error(
-                    "No cached message found for this exact phone/id â€” WhatsApp may have delivered it under a different id (e.g. @lid instead of @c.us). Pass \"useLastMessage\": true to reply to the most recent inbound message from anyone instead."
+                    "No cached message found for this exact phone/id — WhatsApp may have delivered it under a different id (e.g. @lid instead of @c.us). Pass \"useLastMessage\": true to reply to the most recent inbound message from anyone instead."
                 )
             );
         }
@@ -363,17 +653,17 @@ app.post("/test/react", async (req, res) => {
         }
 
         const chatId = chatIdFromPhone(phone);
-        let target = recentMessages[chatId];
+        let target = req.wa.recentMessages[chatId];
 
         if (!target && useLastMessage) {
-            target = lastReceivedMessage;
+            target = req.wa.lastReceivedMessage;
         }
 
         if (!target) {
             return failure(
                 res,
                 new Error(
-                    "No cached message found for this exact phone/id â€” WhatsApp may have delivered it under a different id (e.g. @lid instead of @c.us). Pass \"useLastMessage\": true to react to the most recent inbound message from anyone instead."
+                    "No cached message found for this exact phone/id — WhatsApp may have delivered it under a different id (e.g. @lid instead of @c.us). Pass \"useLastMessage\": true to react to the most recent inbound message from anyone instead."
                 )
             );
         }
@@ -381,7 +671,7 @@ app.post("/test/react", async (req, res) => {
         await target.react(emoji);
 
         console.log(
-            `[REACT] Attempted react on id=${target.id?._serialized} from=${target.from} type=${target.type}`
+            `[${req.wa.id}] [REACT] Attempted react on id=${target.id?._serialized} from=${target.from} type=${target.type}`
         );
 
         success(res, {
@@ -430,7 +720,7 @@ app.post("/test/send-location", async (req, res) => {
 
         const chatId = chatIdFromPhone(phone);
 
-        await client.sendMessage(
+        await req.wa.client.sendMessage(
             chatId,
             location
         );
@@ -476,7 +766,7 @@ app.post("/test/poll", async (req, res) => {
 
         const chatId = chatIdFromPhone(phone);
 
-        await client.sendMessage(
+        await req.wa.client.sendMessage(
             chatId,
             poll
         );
@@ -510,11 +800,11 @@ app.post("/test/contact", async (req, res) => {
             );
         }
 
-        const contact = await client.getContactById(
+        const contact = await req.wa.client.getContactById(
             chatIdFromPhone(contactPhone)
         );
 
-        await client.sendMessage(
+        await req.wa.client.sendMessage(
             chatIdFromPhone(phone),
             contact
         );
@@ -538,7 +828,7 @@ app.get(
     async (req, res) => {
         try {
             const contact =
-                await client.getContactById(
+                await req.wa.client.getContactById(
                     chatIdFromPhone(
                         req.params.phone
                     )
@@ -566,7 +856,7 @@ app.get(
     async (req, res) => {
         try {
             const chat =
-                await client.getChatById(
+                await req.wa.client.getChatById(
                     chatIdFromPhone(
                         req.params.phone
                     )
@@ -608,7 +898,7 @@ app.post("/test/mute", async (req, res) => {
         }
 
         const chat =
-            await client.getChatById(
+            await req.wa.client.getChatById(
                 chatIdFromPhone(phone)
             );
 
@@ -643,7 +933,7 @@ app.post("/test/unmute", async (req, res) => {
         }
 
         const chat =
-            await client.getChatById(
+            await req.wa.client.getChatById(
                 chatIdFromPhone(phone)
             );
 
@@ -674,7 +964,7 @@ app.post("/test/block", async (req, res) => {
         }
 
         const contact =
-            await client.getContactById(
+            await req.wa.client.getContactById(
                 chatIdFromPhone(phone)
             );
 
@@ -705,7 +995,7 @@ app.post("/test/unblock", async (req, res) => {
         }
 
         const contact =
-            await client.getContactById(
+            await req.wa.client.getContactById(
                 chatIdFromPhone(phone)
             );
 
@@ -727,7 +1017,7 @@ app.post("/test/unblock", async (req, res) => {
 app.get("/test/groups", async (req, res) => {
     try {
         const chats =
-            await client.getChats();
+            await req.wa.client.getChats();
 
         const groups = chats
             .filter((chat) => chat.isGroup)
@@ -755,7 +1045,7 @@ app.get(
     async (req, res) => {
         try {
             const group =
-                await client.getChatById(
+                await req.wa.client.getChatById(
                     req.params.groupId
                 );
 
@@ -800,7 +1090,7 @@ app.get(
     async (req, res) => {
         try {
             const group =
-                await client.getChatById(
+                await req.wa.client.getChatById(
                     req.params.groupId
                 );
 
@@ -848,7 +1138,7 @@ app.post(
             }
 
             const result =
-                await client.acceptInvite(
+                await req.wa.client.acceptInvite(
                     inviteCode
                 );
 
@@ -896,7 +1186,7 @@ app.post(
                 );
 
             const group =
-                await client.createGroup(
+                await req.wa.client.createGroup(
                     name,
                     ids
                 );
@@ -935,7 +1225,7 @@ app.post(
             }
 
             const group =
-                await client.getChatById(
+                await req.wa.client.getChatById(
                     groupId
                 );
 
@@ -978,7 +1268,7 @@ app.post(
             }
 
             const group =
-                await client.getChatById(
+                await req.wa.client.getChatById(
                     groupId
                 );
 
@@ -1027,7 +1317,7 @@ app.post(
             }
 
             const group =
-                await client.getChatById(
+                await req.wa.client.getChatById(
                     groupId
                 );
 
@@ -1077,7 +1367,7 @@ app.post(
             }
 
             const group =
-                await client.getChatById(
+                await req.wa.client.getChatById(
                     groupId
                 );
 
@@ -1127,7 +1417,7 @@ app.post(
             }
 
             const group =
-                await client.getChatById(
+                await req.wa.client.getChatById(
                     groupId
                 );
 
@@ -1177,7 +1467,7 @@ app.post(
             }
 
             const group =
-                await client.getChatById(
+                await req.wa.client.getChatById(
                     groupId
                 );
 
@@ -1221,7 +1511,7 @@ app.post(
                 );
             }
 
-            await client.sendMessage(
+            await req.wa.client.sendMessage(
                 groupId,
                 message
             );
@@ -1261,7 +1551,7 @@ app.post(
             }
 
             const group =
-                await client.getChatById(
+                await req.wa.client.getChatById(
                     groupId
                 );
 
@@ -1323,7 +1613,7 @@ app.post(
                 );
             }
 
-            await client.setStatus(
+            await req.wa.client.setStatus(
                 status
             );
 
@@ -1364,7 +1654,7 @@ app.post(
             }
 
             const contact =
-                await client.getContactById(
+                await req.wa.client.getContactById(
                     chatIdFromPhone(
                         contactPhone
                     )
@@ -1373,7 +1663,7 @@ app.post(
             const chatId =
                 chatIdFromPhone(phone);
 
-            await client.sendMessage(
+            await req.wa.client.sendMessage(
                 chatId,
                 contact
             );
@@ -1415,17 +1705,17 @@ app.post(
             }
 
             const chatId = chatIdFromPhone(phone);
-            let mediaMessage = recentMediaMessages[chatId];
+            let mediaMessage = req.wa.recentMediaMessages[chatId];
 
             if (!mediaMessage && useLastMessage) {
-                mediaMessage = lastReceivedMediaMessage;
+                mediaMessage = req.wa.lastReceivedMediaMessage;
             }
 
             if (!mediaMessage) {
                 return failure(
                     res,
                     new Error(
-                        "No cached media message found for this exact phone/id â€” WhatsApp may have delivered it under a different id (e.g. @lid). Pass \"useLastMessage\": true to use the most recent inbound media from anyone instead."
+                        "No cached media message found for this exact phone/id — WhatsApp may have delivered it under a different id (e.g. @lid). Pass \"useLastMessage\": true to use the most recent inbound media from anyone instead."
                     )
                 );
             }
@@ -1466,18 +1756,16 @@ app.post(
    EXPRESS SERVER
 ========================= */
 
-app.listen(
-    3000,
-    "0.0.0.0",
-    () => {
-        console.log(
-            "WhatsApp API running on port 3000"
-        );
-    }
-);
+app.listen(3000, "0.0.0.0", () => {
+    console.log("WhatsApp API running on port 3000");
+});
 
 /* =========================
-   START WHATSAPP
+   START ACCOUNTS
+   The default account always exists; others are restored from
+   accounts.json. Start-ups are staggered to spread the load.
 ========================= */
 
-client.initialize();
+const savedIds = loadAccountIds();
+if (!savedIds.includes(DEFAULT_ACCOUNT)) savedIds.unshift(DEFAULT_ACCOUNT);
+savedIds.forEach((id, index) => startAccount(id, index * 5000));
